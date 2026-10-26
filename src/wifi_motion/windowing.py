@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections import Counter
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -134,12 +135,14 @@ class SlidingWindower:
         self._nodes: dict[str, _NodeState] = {}
         # Contador público: muestras descartadas por no ser utilizables.
         self.dropped: int = 0
+        self.issue_counts: Counter[IssueCode] = Counter()
 
     # ------------------------------------------------------------------ push
 
     def push(self, sample: CsiSample) -> list[Window]:
         """Procesa una muestra y devuelve las ventanas que ella completa."""
         issues = self._validator.check(sample)
+        self.issue_counts.update(issue.code for issue in issues)
         node_known = all(issue.code is not IssueCode.MISSING_NODE_ID for issue in issues)
         if node_known:
             # Un nodo que solo manda basura queda registrado (y se verá obsoleto).
@@ -157,6 +160,13 @@ class SlidingWindower:
         state.buffer.append((ts, amplitudes, rssi))
         state.last_ts = ts
         return windows
+
+    def reset(self) -> None:
+        """Borra el estado de ventanas y validación para iniciar un flujo nuevo."""
+        self._validator = StreamValidator(max_gap_s=self._max_gap_s)
+        self._nodes.clear()
+        self.dropped = 0
+        self.issue_counts.clear()
 
     def _complete_windows(self, node_id: str, state: _NodeState, ts: float) -> list[Window]:
         """Emite las ventanas del nodo que termina de completar un timestamp ``ts``."""
