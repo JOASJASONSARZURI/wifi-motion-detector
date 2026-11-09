@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import replace
+from datetime import datetime, timezone
 import json
 import math
 import sys
@@ -13,15 +15,26 @@ from pathlib import Path
 import numpy as np
 
 from wifi_motion.calibration import fit_baseline, load_baseline, save_baseline
-from wifi_motion.classifiers.base import CLASS_STATES
+from wifi_motion.classifiers.base import CLASS_STATES, Classifier, Prediction
 from wifi_motion.classifiers.softmax import (
     SoftmaxClassifier,
     SoftmaxConfig,
     macro_f1,
 )
-from wifi_motion.classifiers.threshold import ThresholdClassifier, ThresholdConfig
+from wifi_motion.classifiers.threshold import (
+    ThresholdClassifier,
+    ThresholdConfig,
+    tune_thresholds,
+)
 from wifi_motion.dataset import build_dataset, split_by_session
 from wifi_motion.detector import Detector, run_samples
+from wifi_motion.evaluation import (
+    check_disjoint_sessions,
+    majority_baseline,
+    report_label,
+    stream_evaluation,
+    window_metrics,
+)
 from wifi_motion.features import FeatureConfig, FeatureError, extract_features
 from wifi_motion.io_jsonl import iter_recording, write_recording
 from wifi_motion.schema import CsiSample, SessionMetadata
@@ -34,6 +47,10 @@ _SYNTHETIC_SEGMENTS = [
     ("present_still", 12.0),
     ("present_moving", 12.0),
 ]
+_EVAL_THRESHOLD_GRID = (
+    0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 10.0, 15.0,
+    20.0, 30.0, 40.0, 50.0, 80.0, 120.0,
+)
 
 
 def _add_window_options(parser: argparse.ArgumentParser) -> None:
@@ -239,6 +256,267 @@ def _run(args: argparse.Namespace) -> int:
     return 0
 
 
+class _MajorityClassifier:
+    name = "majority-baseline"
+
+    def __init__(self, state: str) -> None:
+        self.state = state
+
+    def predict(self, _features: np.ndarray) -> Prediction:
+        return Prediction(
+            state=self.state,
+            scores={label: float(label == self.state) for label in CLASS_STATES},
+            confidence=1.0,
+            source=self.name,
+        )
+
+    def predict_batch(self, X: np.ndarray) -> list[Prediction]:
+        return [self.predict(row) for row in X]
+
+
+def _eval_paths(value: str | None, name: str, *, required: bool) -> list[Path]:
+    paths = [Path(part.strip()) for part in (value or "").split(",") if part.strip()]
+    if required and not paths:
+        raise ValueError(f"--{name} debe incluir al menos un archivo JSONL")
+    return paths
+
+
+def _check_unique_session_ids(
+    recordings: list[tuple[SessionMetadata, list[CsiSample]]], split: str
+) -> list[str]:
+    ids = [metadata.session_id for metadata, _samples in recordings]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"hay session_id repetido dentro de --{split}")
+    return ids
+
+
+def _evaluation_detector(
+    classifier: Classifier, args: argparse.Namespace
+) -> Detector:
+    return Detector(
+        SlidingWindower(**_window_config(args)),
+        FeatureConfig(),
+        classifier,
+        StateSmoother(
+            SmoothingConfig(
+                ema_alpha=args.ema_alpha,
+                confirm_n=args.confirm_n,
+                confirm_n_to_absent=args.confirm_n_to_absent,
+                margin=args.margin,
+            )
+        ),
+        stale_timeout_s=args.stale_timeout_s,
+    )
+
+
+def _eval_log_has_match(
+    path: Path, test_ids: list[str], model_paths: dict[str, str]
+) -> bool:
+    if not path.exists():
+        return False
+    expected_ids = sorted(test_ids)
+    with path.open(encoding="utf-8") as log:
+        for line_number, line in enumerate(log, start=1):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{path}: JSON inválido en línea {line_number}: {exc.msg}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(f"{path}: la línea {line_number} debe ser un objeto JSON")
+            if (
+                sorted(record.get("test_ids", [])) == expected_ids
+                and record.get("models") == model_paths
+            ):
+                return True
+    return False
+
+
+def _eval(args: argparse.Namespace) -> int:
+    train_paths = _eval_paths(args.train, "train", required=True)
+    val_paths = _eval_paths(args.val, "val", required=False)
+    test_paths = _eval_paths(args.test, "test", required=True)
+    if not args.baseline:
+        raise ValueError("--baseline es obligatorio para evaluar el clasificador por umbral")
+    if not args.model:
+        raise ValueError("--model es obligatorio para evaluar el clasificador softmax")
+
+    train_recordings = [_read_recording(path) for path in train_paths]
+    val_recordings = [_read_recording(path) for path in val_paths]
+    test_recordings = [_read_recording(path) for path in test_paths]
+    train_ids = _check_unique_session_ids(train_recordings, "train")
+    val_ids = _check_unique_session_ids(val_recordings, "val")
+    test_ids = _check_unique_session_ids(test_recordings, "test")
+    check_disjoint_sessions(train_ids, val_ids, test_ids)
+
+    train_data = build_dataset(train_recordings, _window_config(args), FeatureConfig())
+    val_data = build_dataset(val_recordings, _window_config(args), FeatureConfig())
+    test_data = build_dataset(test_recordings, _window_config(args), FeatureConfig())
+    if not train_data.y:
+        raise ValueError("el conjunto train no contiene ventanas etiquetadas válidas")
+    if val_recordings and not val_data.y:
+        raise ValueError("el conjunto val no contiene ventanas etiquetadas válidas")
+    if not test_data.y:
+        raise ValueError("el conjunto test no contiene ventanas etiquetadas válidas")
+
+    baseline = load_baseline(args.baseline)
+    if val_recordings:
+        threshold_config = tune_thresholds(
+            baseline,
+            val_data.X,
+            val_data.y,
+            _EVAL_THRESHOLD_GRID,
+            _EVAL_THRESHOLD_GRID,
+        )
+    else:
+        threshold_config = ThresholdConfig(
+            motion_z=args.motion_z,
+            presence_z=args.presence_z,
+        )
+    softmax = SoftmaxClassifier.load(args.model)
+    majority_state = majority_baseline(train_data.y, ["absent"])[0]
+    true_labels = test_data.y
+    predictions: dict[str, list[str]] = {
+        "baseline": [majority_state] * len(true_labels),
+        "threshold": [
+            item.state
+            for item in ThresholdClassifier(baseline, threshold_config).predict_batch(
+                test_data.X
+            )
+        ],
+        "softmax": [item.state for item in softmax.predict_batch(test_data.X)],
+    }
+
+    evidence = report_label([metadata for metadata, _samples in test_recordings])
+    window_counts = Counter(true_labels)
+    counts_by_class = {state: window_counts[state] for state in CLASS_STATES}
+    comparison: dict[str, dict[str, object]] = {}
+    classifier_factories = {
+        "baseline": lambda: _MajorityClassifier(majority_state),
+        "threshold": lambda: ThresholdClassifier(baseline, threshold_config),
+        "softmax": lambda: SoftmaxClassifier.load(args.model),
+    }
+    for name in ("baseline", "threshold", "softmax"):
+        report = window_metrics(true_labels, predictions[name])
+        report = replace(
+            report,
+            evidence=evidence,
+            n_sessions=len(test_ids),
+            n_windows_by_class=tuple(
+                (state, counts_by_class[state]) for state in CLASS_STATES
+            ),
+            session_ids=tuple(test_ids),
+        )
+        stream_report = stream_evaluation(
+            lambda factory=classifier_factories[name]: _evaluation_detector(
+                factory(), args
+            ),
+            test_recordings,
+            transition_tolerance_s=args.transition_tolerance_s,
+        )
+        comparison[name] = {
+            "window": report.to_dict(),
+            "stream": stream_report.to_dict(),
+        }
+
+    model_paths = {
+        "baseline": str(Path(args.baseline).resolve()),
+        "softmax": str(Path(args.model).resolve()),
+    }
+    parameters = {
+        "window": _window_config(args),
+        "smoothing": {
+            "ema_alpha": args.ema_alpha,
+            "confirm_n": args.confirm_n,
+            "confirm_n_to_absent": args.confirm_n_to_absent,
+            "margin": args.margin,
+            "stale_timeout_s": args.stale_timeout_s,
+        },
+        "transition_tolerance_s": args.transition_tolerance_s,
+        "threshold_config": {
+            "motion_features": list(threshold_config.motion_features),
+            "presence_features": list(threshold_config.presence_features),
+            "motion_z": threshold_config.motion_z,
+            "presence_z": threshold_config.presence_z,
+            "tuned_on_validation": bool(val_recordings),
+            "grid": list(_EVAL_THRESHOLD_GRID) if val_recordings else None,
+        },
+    }
+    report_record = {
+        "evidence": evidence,
+        "n_sessions": len(test_ids),
+        "session_ids": test_ids,
+        "n_windows": len(true_labels),
+        "n_windows_by_class": counts_by_class,
+        "parameters": parameters,
+        "models": model_paths,
+        "comparison": comparison,
+    }
+
+    destination = Path(args.out_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "report.json").write_text(
+        json.dumps(report_record, ensure_ascii=False, allow_nan=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    markdown = [
+        f"Evidence: {evidence}",
+        "",
+        f"Sesiones TEST: {len(test_ids)} ({', '.join(test_ids)})",
+        f"Ventanas TEST: {len(true_labels)}; por clase: "
+        + ", ".join(f"{label}={counts_by_class[label]}" for label in CLASS_STATES),
+        "",
+        "| Clasificador | Macro F1 (ventanas) | Macro F1 (flujo) | Falsas alarmas de flujo | Latencia missed |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    if evidence == "SYNTHETIC":
+        markdown.insert(
+            1,
+            "La separabilidad es por construcción; esto no valida el sistema con hardware real",
+        )
+    for name in ("baseline", "threshold", "softmax"):
+        window = comparison[name]["window"]
+        flow = comparison[name]["stream"]
+        assert isinstance(window, dict) and isinstance(flow, dict)
+        missed = sum(
+            int(item["missed"])
+            for item in flow["latency_by_transition"].values()  # type: ignore[union-attr]
+        )
+        markdown.append(
+            f"| {name} | {window['macro_f1']} | "
+            f"{flow['window_metrics']['macro_f1']} | "
+            f"{flow['flow_false_alarm_count']} | {missed} |"  # type: ignore[index]
+        )
+    markdown.extend(
+        [
+            "",
+            "## Parámetros",
+            "",
+            "```json",
+            json.dumps(parameters, ensure_ascii=False, indent=2),
+            "```",
+        ]
+    )
+    (destination / "report.md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
+
+    log_path = destination / "eval_log.jsonl"
+    if _eval_log_has_match(log_path, test_ids, model_paths):
+        print(
+            "advertencia: este conjunto de prueba ya se usó; el resultado deja de ser una evaluación única",
+            file=sys.stderr,
+        )
+    log_record = {
+        "date": datetime.now(timezone.utc).isoformat(),
+        "test_ids": sorted(test_ids),
+        "models": model_paths,
+    }
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(json.dumps(log_record, ensure_ascii=False, allow_nan=False) + "\n")
+    print(f"Evaluación guardada en {destination}")
+    return 0
+
+
 def _record(_args: argparse.Namespace) -> int:
     print(
         "record requiere hardware y el formato real de la fuente CSI; aún no implementado",
@@ -299,6 +577,45 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_window_options(run)
     run.set_defaults(handler=_run)
+
+    evaluate = commands.add_parser(
+        "eval",
+        description=(
+            "Evalúa en test (una sola vez) un baseline mayoritario, un clasificador "
+            "por umbral y un modelo softmax, tanto por ventana como en flujo. "
+            "Los argumentos --train, --val y --test son listas separadas por coma "
+            "de rutas de grabaciones JSONL etiquetadas; las sesiones deben ser "
+            "disjuntas. Si se proporciona "
+            "--val, tune_thresholds ajusta motion_z/presence_z exclusivamente con "
+            "sus ventanas. El modelo softmax se carga sin reentrenar. El resultado "
+            "se guarda en report.json/report.md y cada ejecución test se agrega a "
+            "eval_log.jsonl; reutilizar modelo y sesiones de test se advierte."
+        ),
+    )
+    evaluate.add_argument("--train", required=True, help="rutas JSONL separadas por coma")
+    evaluate.add_argument(
+        "--val",
+        help="rutas JSONL separadas por coma; solo se usan para ajustar umbrales",
+    )
+    evaluate.add_argument("--test", required=True, help="rutas JSONL separadas por coma")
+    evaluate.add_argument("--baseline", required=True, help="línea base calibrada JSON")
+    evaluate.add_argument("--model", required=True, help="modelo softmax JSON ya entrenado")
+    evaluate.add_argument("--out-dir", required=True)
+    evaluate.add_argument(
+        "--transition-tolerance-s",
+        type=float,
+        default=0.5,
+        help="exclusión alrededor de transiciones reales para métricas de flujo",
+    )
+    evaluate.add_argument("--ema-alpha", type=float, default=0.4)
+    evaluate.add_argument("--confirm-n", type=int, default=3)
+    evaluate.add_argument("--confirm-n-to-absent", type=int, default=5)
+    evaluate.add_argument("--margin", type=float, default=0.05)
+    evaluate.add_argument("--stale-timeout-s", type=float, default=5.0)
+    evaluate.add_argument("--motion-z", type=float, default=3.0)
+    evaluate.add_argument("--presence-z", type=float, default=120.0)
+    _add_window_options(evaluate)
+    evaluate.set_defaults(handler=_eval)
 
     record = commands.add_parser("record")
     record.set_defaults(handler=_record)
