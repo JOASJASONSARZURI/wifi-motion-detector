@@ -13,6 +13,7 @@ venv/
 .coverage
 htmlcov/
 .ipynb_checkpoints/
-
+artifacts/
+data/
 # Datos reales: no se versionan
 data/recordings/
