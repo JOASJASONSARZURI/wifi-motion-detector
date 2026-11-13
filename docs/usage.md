@@ -1,5 +1,7 @@
 # Guía de uso
 
+Para ejecutar la CLI en un contenedor, consulta la [guía de Docker](./docker.md).
+
 ## Requisitos
 
 Python 3.10 o posterior. El paquete necesita NumPy; las pruebas usan pytest.

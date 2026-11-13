@@ -1,0 +1,9 @@
+services:
+  wifi-motion:
+    build: .
+    image: wifi-motion-detector:local
+    working_dir: /app
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+    entrypoint: ["wifi-motion"]
